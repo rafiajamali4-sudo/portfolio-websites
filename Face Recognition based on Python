@@ -1,0 +1,165 @@
+import cv2
+import face_recognition
+import numpy as np
+import os
+import sqlite3
+import datetime
+from flask import Flask, render_template, jsonify, redirect, url_for
+
+app = Flask(__name__)
+
+# --- CONFIGURATION ---
+KNOWN_FACES_DIR = 'images'  # Photos ka folder
+DB_NAME = 'attendance.db'
+
+# --- DATABASE SETUP ---
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            date TEXT NOT NULL,
+            time TEXT NOT NULL
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+# --- LOAD KNOWN FACES (Dataset) ---
+known_face_encodings = []
+known_face_names = []
+
+def load_dataset():
+    # Clear previous data
+    known_face_encodings.clear()
+    known_face_names.clear()
+    
+    if not os.path.exists(KNOWN_FACES_DIR):
+        print(f"Error: Dataset folder '{KNOWN_FACES_DIR}' not found!")
+        return
+        
+    for filename in os.listdir(KNOWN_FACES_DIR):
+        if filename.endswith(".jpg") or filename.endswith(".png"):
+            path = os.path.join(KNOWN_FACES_DIR, filename)
+            
+            # Use safe image loading to prevent crashes
+            image = face_recognition.load_image_file(path)
+            encodings = face_recognition.face_encodings(image)
+            
+            if len(encodings) > 0:
+                encoding = encodings[0]
+                known_face_encodings.append(encoding)
+                
+                # Use filenames as names (e.g., Aliza.jpg -> Aliza)
+                name = os.path.splitext(filename)[0]
+                known_face_names.append(name)
+    
+    print(f"Loaded {len(known_face_names)} faces: {known_face_names}")
+
+# --- MARK ATTENDANCE (Save to DB) ---
+def mark_attendance(name):
+    with app.app_context():
+        # Get current time and date
+        now = datetime.datetime.now()
+        date = now.strftime('%Y-%m-%d')
+        time = now.strftime('%H:%M:%S')
+        
+        # Connect to DB and save
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        
+        # Check if attendance is already marked today for this person
+        cursor.execute("SELECT id FROM attendance WHERE name=? AND date=?", (name, date))
+        existing_record = cursor.fetchone()
+        
+        if not existing_record:
+            cursor.execute("INSERT INTO attendance (name, date, time) VALUES (?, ?, ?)", (name, date, time))
+            conn.commit()
+            print(f"Attendance marked for {name} at {time}")
+        else:
+            print(f"Attendance already marked for {name} today.")
+            
+        conn.close()
+
+# --- WEB ROUTES ---
+@app.route('/')
+def index():
+    # Get all attendance records from DB
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, name, date, time FROM attendance ORDER BY id DESC")
+    attendance_records = cursor.fetchall()
+    conn.close()
+    
+    # Reload dataset count
+    dataset_count = len(known_face_names)
+    
+    return render_template('index.html', attendance=attendance_records, dataset_count=dataset_count)
+
+@app.route('/take-attendance')
+def take_attendance():
+    """Camera on karke attendance lagayega"""
+    # Force reload dataset to capture new images
+    load_dataset()
+    
+    # Start Camera (OpenCV)
+    video_capture = cv2.VideoCapture(0)
+    
+    print("Attendance session started. Press 'q' on camera window to quit.")
+    
+    while True:
+        ret, frame = video_capture.read()
+        
+        # Convert BGR (OpenCV) to RGB (face_recognition)
+        rgb_frame = frame[:, :, ::-1]
+        
+        # Detect faces
+        face_locations = face_recognition.face_locations(rgb_frame)
+        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
+        
+        # Recognize faces
+        for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
+            matches = face_recognition.compare_faces(known_face_encodings, face_encoding)
+            name = "Unknown"
+            
+            # Find the closest match
+            if True in matches:
+                first_match_index = matches.index(True)
+                name = known_face_names[first_match_index]
+                
+                # Mark attendance if face is recognized
+                mark_attendance(name)
+            
+            # Draw rectangle and name on face
+            cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
+            cv2.putText(frame, name, (left + 6, bottom - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+        # Display the video
+        cv2.imshow('Attendance System - Camera', frame)
+        
+        # Quit on 'q' press
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+            
+    # Release resources
+    video_capture.release()
+    cv2.destroyAllWindows()
+    
+    # Redirect back to index page to see results
+    return redirect(url_for('index'))
+
+@app.route('/save-profile')
+def save_profile():
+    """Camera open karke naya image capture karega (Placeholder)"""
+    return jsonify({"message": "Please use the 'Take Images' function from your VS Code terminal to capture images for new registration."})
+
+# --- START APP ---
+if __name__ == '__main__':
+    # Initialize DB and Dataset on startup
+    init_db()
+    load_dataset()
+    
+    # Run the server
+    app.run(host='0.0.0.0', port=5000, debug=True)
